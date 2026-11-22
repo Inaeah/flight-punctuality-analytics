@@ -2,8 +2,12 @@
 ETL: 2015 US flight data (CSV) -> PostgreSQL star schema.
 
 Usage:
-    python etl_flights.py
+    python etl_flights.py                # default months: 1 2 3
+    python etl_flights.py --months 2 3   # reload only Feb and Mar
+
+Exit code is 1 if the ETL fails or reconciliation finds a mismatch.
 """
+import argparse
 import io
 import logging
 import os
@@ -22,7 +26,7 @@ LOG_FILE = BASE_DIR / "etl.log"
 DATE_DIM_START = date(2015, 1, 1)
 DATE_DIM_END = date(2015, 12, 31)
 
-MONTHS = [1, 2, 3]
+DEFAULT_MONTHS = [1, 2, 3]
 CHUNK_SIZE = 500_000
 
 SOURCE_COLS = [
@@ -209,9 +213,24 @@ def load_month(conn, month: int, df: pd.DataFrame) -> None:
                  month, deleted, cur.rowcount)
 
 
-def load_facts(conn, months: list[int]) -> None:
+def source_stats(src: pd.DataFrame) -> pd.DataFrame:
+    # computed on the raw CSV rows, independently of the transform logic
+    completed = (src["CANCELLED"] == 0) & (src["DIVERTED"] == 0)
+    on_time = completed & (src["ARRIVAL_DELAY"] <= 15)
+    return pd.DataFrame({
+        "month": src["MONTH"],
+        "rows": 1,
+        "completed": completed.astype(int),
+        "on_time": on_time.astype(int),
+    }).groupby("month").sum()
+
+
+def load_facts(conn, months: list[int]) -> pd.DataFrame:
     key_maps = get_key_maps(conn)
-    parts = [transform_flights(chunk, key_maps) for chunk in extract_flights(months)]
+    parts, stats = [], []
+    for chunk in extract_flights(months):
+        stats.append(source_stats(chunk))
+        parts.append(transform_flights(chunk, key_maps))
     flights = drop_orphans(pd.concat(parts))
     log.info("extracted %d flight rows for months %s", len(flights), months)
 
@@ -223,19 +242,70 @@ def load_facts(conn, months: list[int]) -> None:
             log.warning("month %02d: dropped %d duplicate rows", month, before - len(df))
         load_month(conn, month, df)
 
+    # a chunk can hold the end of one month and the start of the next
+    return pd.concat(stats).groupby(level=0).sum()
+
+
+def reconcile(conn, source: pd.DataFrame, months: list[int]) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT d.month,
+                   COUNT(*),
+                   COUNT(f.is_delayed_15),
+                   COUNT(*) FILTER (WHERE NOT f.is_delayed_15)
+            FROM dw.fact_flights f
+            JOIN dw.dim_date d USING (date_key)
+            WHERE d.month = ANY(%s)
+            GROUP BY d.month
+        """, (months,))
+        warehouse = pd.DataFrame(
+            cur.fetchall(), columns=["month", "rows", "completed", "on_time"]
+        ).set_index("month")
+
+    ok = True
+    for month in months:
+        src = source.loc[month] if month in source.index else pd.Series(0, index=warehouse.columns)
+        dw = warehouse.loc[month] if month in warehouse.index else pd.Series(0, index=warehouse.columns)
+        src_otp = 100 * src["on_time"] / src["completed"] if src["completed"] else 0
+        dw_otp = 100 * dw["on_time"] / dw["completed"] if dw["completed"] else 0
+        matched = (src == dw).all()
+        ok &= matched
+        log.log(
+            logging.INFO if matched else logging.ERROR,
+            "reconcile month %02d: rows %d vs %d, OTP %.2f%% vs %.2f%% (source vs warehouse) %s",
+            month, src["rows"], dw["rows"], src_otp, dw_otp, "OK" if matched else "MISMATCH",
+        )
+    return ok
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument(
+        "--months", type=int, nargs="+", default=DEFAULT_MONTHS,
+        choices=range(1, 13), metavar="M", help="months of 2015 to load (1-12)",
+    )
+    return parser.parse_args()
+
 
 def main() -> None:
+    args = parse_args()
+    months = sorted(set(args.months))
     setup_logging()
-    log.info("ETL started")
+    log.info("ETL started, months %s", months)
     conn = get_connection()
     try:
         load_dimensions(conn)
-        load_facts(conn, MONTHS)
+        source = load_facts(conn, months)
+        ok = reconcile(conn, source, months)
     except Exception:
         log.exception("ETL failed")
         raise
     finally:
         conn.close()
+
+    if not ok:
+        log.error("ETL finished with reconciliation errors")
+        sys.exit(1)
     log.info("ETL finished")
 
 
