@@ -4,12 +4,14 @@ ETL: 2015 US flight data (CSV) -> PostgreSQL star schema.
 Usage:
     python etl_flights.py
 """
+import io
 import logging
 import os
 import sys
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import psycopg2
 from dotenv import load_dotenv
 
@@ -19,6 +21,26 @@ LOG_FILE = BASE_DIR / "etl.log"
 
 DATE_DIM_START = date(2015, 1, 1)
 DATE_DIM_END = date(2015, 12, 31)
+
+MONTHS = [1, 2, 3]
+CHUNK_SIZE = 500_000
+
+SOURCE_COLS = [
+    "YEAR", "MONTH", "DAY", "AIRLINE", "FLIGHT_NUMBER",
+    "ORIGIN_AIRPORT", "DESTINATION_AIRPORT", "SCHEDULED_DEPARTURE",
+    "DEPARTURE_DELAY", "ARRIVAL_DELAY", "DISTANCE",
+    "DIVERTED", "CANCELLED", "CANCELLATION_REASON",
+]
+FACT_COLS = [
+    "date_key", "airline_key", "origin_airport_key", "dest_airport_key",
+    "flight_number", "scheduled_departure",
+    "departure_delay_min", "arrival_delay_min", "distance_miles",
+    "is_cancelled", "is_diverted", "cancellation_reason", "is_delayed_15",
+]
+NATURAL_KEY = [
+    "date_key", "airline_key", "flight_number",
+    "origin_airport_key", "scheduled_departure",
+]
 
 log = logging.getLogger("etl_flights")
 
@@ -104,12 +126,111 @@ def load_dimensions(conn) -> None:
         load_dim_airport(cur)
         load_dim_date(cur)
 
+
+def get_key_maps(conn) -> dict:
+    # natural key -> surrogate key, used to translate codes in the fact rows
+    with conn.cursor() as cur:
+        cur.execute("SELECT airline_code, airline_key FROM dw.dim_airline")
+        airlines = dict(cur.fetchall())
+        cur.execute("SELECT airport_code, airport_key FROM dw.dim_airport")
+        airports = dict(cur.fetchall())
+    return {"airline": airlines, "airport": airports}
+
+
+def extract_flights(months: list[int]):
+    # read in chunks so the 565 MB file never sits in memory at once
+    reader = pd.read_csv(
+        DATA_DIR / "flights.csv",
+        usecols=SOURCE_COLS,
+        dtype={"ORIGIN_AIRPORT": str, "DESTINATION_AIRPORT": str,
+               "SCHEDULED_DEPARTURE": str, "CANCELLATION_REASON": str},
+        chunksize=CHUNK_SIZE,
+    )
+    for chunk in reader:
+        chunk = chunk[chunk["MONTH"].isin(months)]
+        if not chunk.empty:
+            yield chunk
+
+
+def transform_flights(src: pd.DataFrame, key_maps: dict) -> pd.DataFrame:
+    out = pd.DataFrame(index=src.index)
+    out["month"] = src["MONTH"]
+    out["date_key"] = src["YEAR"] * 10000 + src["MONTH"] * 100 + src["DAY"]
+    out["airline_key"] = src["AIRLINE"].map(key_maps["airline"])
+    out["origin_airport_key"] = src["ORIGIN_AIRPORT"].map(key_maps["airport"])
+    out["dest_airport_key"] = src["DESTINATION_AIRPORT"].map(key_maps["airport"])
+    out["flight_number"] = src["FLIGHT_NUMBER"]
+    hhmm = src["SCHEDULED_DEPARTURE"]
+    out["scheduled_departure"] = hhmm.str[:2] + ":" + hhmm.str[2:]
+
+    # nullable Int16 keeps NULL delays as NULL instead of turning them into floats
+    out["departure_delay_min"] = src["DEPARTURE_DELAY"].astype("Int16")
+    out["arrival_delay_min"] = src["ARRIVAL_DELAY"].astype("Int16")
+    out["distance_miles"] = src["DISTANCE"]
+
+    out["is_cancelled"] = src["CANCELLED"] == 1
+    out["is_diverted"] = src["DIVERTED"] == 1
+    out["cancellation_reason"] = src["CANCELLATION_REASON"]
+
+    completed = ~(out["is_cancelled"] | out["is_diverted"])
+    out["is_delayed_15"] = (out["arrival_delay_min"] > 15).astype("boolean")
+    out.loc[~completed, "is_delayed_15"] = pd.NA
+    return out
+
+
+def drop_orphans(df: pd.DataFrame) -> pd.DataFrame:
+    keys = ["airline_key", "origin_airport_key", "dest_airport_key"]
+    orphan = df[keys].isna().any(axis=1)
+    if orphan.any():
+        log.warning("dropped %d rows with codes missing from dimensions", orphan.sum())
+    df = df[~orphan].copy()
+    df[keys] = df[keys].astype("int16")
+    return df
+
+
+def load_month(conn, month: int, df: pd.DataFrame) -> None:
+    start_key = 2015 * 10000 + month * 100
+    buf = io.StringIO()
+    df[FACT_COLS].to_csv(buf, index=False, header=False)
+    buf.seek(0)
+
+    # delete-insert in one transaction: re-running a month replaces it, never duplicates it
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM dw.fact_flights WHERE date_key BETWEEN %s AND %s",
+            (start_key + 1, start_key + 31),
+        )
+        deleted = cur.rowcount
+        cur.copy_expert(
+            f"COPY dw.fact_flights ({', '.join(FACT_COLS)}) FROM STDIN WITH (FORMAT csv)",
+            buf,
+        )
+        log.info("fact_flights month %02d: deleted %d, inserted %d",
+                 month, deleted, cur.rowcount)
+
+
+def load_facts(conn, months: list[int]) -> None:
+    key_maps = get_key_maps(conn)
+    parts = [transform_flights(chunk, key_maps) for chunk in extract_flights(months)]
+    flights = drop_orphans(pd.concat(parts))
+    log.info("extracted %d flight rows for months %s", len(flights), months)
+
+    for month, df in flights.groupby("month"):
+        # dedup per month, since duplicates can sit in different chunks
+        before = len(df)
+        df = df.drop_duplicates(NATURAL_KEY, keep="last")
+        if len(df) < before:
+            log.warning("month %02d: dropped %d duplicate rows", month, before - len(df))
+        load_month(conn, month, df)
+
+
 def main() -> None:
     setup_logging()
     log.info("ETL started")
     conn = get_connection()
     try:
         load_dimensions(conn)
+        load_facts(conn, MONTHS)
     except Exception:
         log.exception("ETL failed")
         raise
